@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import re
 import time
 from typing import Any
 
@@ -353,8 +354,19 @@ class IngestPipeline:
         }
 
     # ---------- 阶段4：校验 ----------
-    def validate_entities(self, batch_no: str | None = None) -> dict[str, Any]:
-        """对标准化明细执行质量校验。"""
+    def validate_entities(
+        self,
+        batch_no: str | None = None,
+        *,
+        scope_batches: list[str] | None = None,
+        replay_id: int | None = None,
+    ) -> dict[str, Any]:
+        """对标准化明细执行质量校验。
+
+        普通调用只校验待校验明细；重放调用通过 scope_batches/replay_id
+        把读取范围严格限制在本次重放确认范围内的标准化明细上，范围外
+        已通过校验的记录不会被读取或改写，仍照常进入统计。
+        """
         parsed = store.rows("parsed_entity")
         quality_rules = store.rows("quality_check")
 
@@ -367,6 +379,11 @@ class IngestPipeline:
         target = [p for p in parsed if p.get("status") == "待校验"]
         if batch_no:
             target = [p for p in target if p.get("来源批次") == batch_no]
+        if scope_batches is not None:
+            scope_set = set(scope_batches)
+            target = [p for p in target if p.get("来源批次") in scope_set]
+        if replay_id is not None:
+            target = [p for p in target if str(p.get("replay_id")) == str(replay_id)]
 
         passed = 0
         failed = 0
@@ -573,50 +590,401 @@ class IngestPipeline:
         return {"ok": True, "message": f"数据源 {source_id} 水位已推进到 {watermark_value}"}
 
     # ---------- 回溯重放 ----------
+    def _resolve_batch_scope(self, history_batch_range: str) -> list[str]:
+        """解析重放批次范围表达式，返回去重且保持顺序的批次号列表。
+
+        支持三种写法并可混用：
+        - 单批次：``INGE-0001``
+        - 逗号/中文逗号/分号/空白分隔的多批次：``INGE-0001,INGE-0002``
+        - 闭区间（``..`` 或 ``~`` 分隔）：``INGE-0001..INGE-0003``
+          仅在两端同前缀同数字位数时展开，否则原样保留。
+        """
+        text = (history_batch_range or "").strip()
+        if not text:
+            return []
+
+        tokens = [t for t in re.split(r"[,，;；\s]+", text) if t.strip()]
+        resolved: list[str] = []
+
+        def remember(batch_no: str) -> None:
+            batch_no = batch_no.strip()
+            if batch_no and batch_no not in resolved:
+                resolved.append(batch_no)
+
+        for token in tokens:
+            range_match = re.match(
+                r"^(?P<left>.+?)(?:\.\.|~)(?P<right>.+)$", token
+            )
+            if range_match is None:
+                remember(token)
+                continue
+            left = range_match.group("left").strip()
+            right = range_match.group("right").strip()
+            left_match = re.match(r"^(?P<prefix>.*?)(?P<num>\d+)$", left)
+            right_match = re.match(r"^(?P<prefix>.*?)(?P<num>\d+)$", right)
+            if (
+                left_match is None
+                or right_match is None
+                or left_match.group("prefix") != right_match.group("prefix")
+                or len(left_match.group("num")) != len(right_match.group("num"))
+            ):
+                # 无法识别为同构数字区间时按两个独立批次处理，避免吞掉批号
+                remember(left)
+                remember(right)
+                continue
+            prefix = left_match.group("prefix")
+            width = len(left_match.group("num"))
+            start = int(left_match.group("num"))
+            end = int(right_match.group("num"))
+            if start > end:
+                start, end = end, start
+            for num in range(start, end + 1):
+                remember(f"{prefix}{num:0{width}d}")
+        return resolved
+
+    def _find_parser_rule(self, rule_name: str | None) -> dict[str, Any] | None:
+        """按名称精确查找解析规则；未指定名称时回退到任意已发布规则。"""
+        parsers = store.rows("field_parser")
+        if rule_name:
+            for p in parsers:
+                if p.get("规则名称") == rule_name:
+                    return p
+        for p in parsers:
+            if p.get("status") == "已发布":
+                return p
+        return None
+
+    def _current_schema_version(self) -> str:
+        schema_versions = store.rows("schema_version")
+        for sv in schema_versions:
+            if sv.get("status") == "已发布":
+                return str(sv.get("版本号", "v1.0"))
+        return "v1.0"
+
+    def _reparse_raw_record(
+        self,
+        raw: dict[str, Any],
+        rule: dict[str, Any],
+        rule_label: str,
+        replay_id: int,
+        schema_ver: str,
+    ) -> dict[str, Any]:
+        """用指定规则对一条原始日志真正重新解析，并在标准化明细中就地替换。
+
+        每条原始记录在 parsed_entity 中只保留一条当前标准化明细（按
+        来源批次 + 原始记录ID 匹配 upsert），重放不新增同键明细。
+        """
+        raw_id = int(raw["id"])
+        batch_no = str(raw.get("批次编号", ""))
+        body = raw.get("原始正文", "")
+        fields = self._parse_body(body, rule)
+        # source_digest 标识本次实际读取到的原文版本，与原文更正指纹同口径，
+        # 便于核对重放究竟读取了哪一份原文；content_digest 标识解析结果。
+        body_digest = raw.get("body_digest") or _stable_digest({"body": body})
+        content_digest = _stable_digest({"body": body, "fields": fields})
+
+        parsed_entities = store.rows("parsed_entity")
+        target: dict[str, Any] | None = None
+        for entity in parsed_entities:
+            if (
+                entity.get("来源批次") == batch_no
+                and str(entity.get("原始记录ID")) == str(raw_id)
+            ):
+                target = entity
+                break
+
+        common = {
+            "来源批次": batch_no,
+            "原始记录ID": str(raw_id),
+            "解析规则版本": rule_label,
+            "标准化字段集": json.dumps(fields, ensure_ascii=False),
+            "校验状态": "",
+            "status": "待校验",
+            "pending": True,
+            "abnormal": False,
+            "parser_rule": rule.get("规则名称"),
+            "schema_version": schema_ver,
+            "parsed_at": _now_iso(),
+            "content_digest": content_digest,
+            "replay_id": str(replay_id),
+            "replayed_at": _now_iso(),
+            "source_batch": batch_no,
+            "source_digest": body_digest,
+        }
+        if target is None:
+            target = {"id": _next_id("parsed_entity")}
+            target.update(common)
+            parsed_entities.append(target)
+        else:
+            target.update(common)
+        return target
+
+    def _write_replay_lineage(
+        self,
+        replay_entry: dict[str, Any],
+        scope: list[str],
+        rule_label: str,
+    ) -> list[dict[str, Any]]:
+        """本轮重放结果回写采集血缘清单。"""
+        lineages = store.rows("data_lineage")
+        parsed_entities = store.rows("parsed_entity")
+        replay_id = replay_entry["id"]
+        created: list[dict[str, Any]] = []
+        for batch_no in scope:
+            # 统计该批次下归属本次重放的全部标准化明细（含中断接续各段），
+            # 而不是只统计最后一个接续段处理的明细。
+            batch_entities = [
+                e
+                for e in parsed_entities
+                if e.get("来源批次") == batch_no
+                and str(e.get("replay_id")) == str(replay_id)
+            ]
+            lineage_entry = {
+                "id": _next_id("data_lineage"),
+                "来源批次": batch_no,
+                "解析规则版本": rule_label,
+                "标准化版本": f"replay-{replay_id}",
+                "下游消费标识": f"replay-{replay_id}:{batch_no}",
+                "记录时间": _now_iso(),
+                "status": "已记录",
+                "pending": False,
+                "abnormal": False,
+                "replay_id": str(replay_id),
+                "record_count": len(batch_entities),
+                "source_digests": json.dumps(
+                    sorted({str(e.get("source_digest", "")) for e in batch_entities}),
+                    ensure_ascii=False,
+                ),
+            }
+            lineages.append(lineage_entry)
+            created.append(lineage_entry)
+        return created
+
+    def correct_raw_record(
+        self,
+        batch_no: str,
+        raw_record_id: int,
+        new_body: str,
+    ) -> dict[str, Any]:
+        """对历史批次中的一条原文下发更正（重放取数链路的一部分）。
+
+        更正会提升原文版本号并刷新正文指纹，重放时按指纹即可核对本次
+        实际读取的是哪一份原文；不存在的批号/记录直接报错且不产生残留。
+        """
+        batches = store.rows("ingest_batch")
+        if not any(b.get("批次编号") == batch_no for b in batches):
+            return {"ok": False, "message": f"批次 {batch_no} 不存在，无法更正原文"}
+
+        raw_records_list = store.rows("raw_records")
+        target: dict[str, Any] | None = None
+        for raw in raw_records_list:
+            if raw.get("批次编号") == batch_no and int(raw.get("id", -1)) == int(raw_record_id):
+                target = raw
+                break
+        if target is None:
+            return {
+                "ok": False,
+                "message": f"批次 {batch_no} 中不存在原始记录 {raw_record_id}",
+            }
+
+        previous_body = target.get("原始正文", "")
+        target["原始正文"] = new_body
+        target["raw_version"] = int(target.get("raw_version", 1)) + 1
+        target["body_digest"] = _stable_digest({"body": new_body})
+        target["corrected_at"] = _now_iso()
+        return {
+            "ok": True,
+            "message": f"批次 {batch_no} 原始记录 {raw_record_id} 原文已更正",
+            "raw_record": target,
+            "raw_version": target["raw_version"],
+            "previous_digest": _stable_digest({"body": previous_body}),
+            "body_digest": target["body_digest"],
+        }
+
     def replay_batch(
         self,
         history_batch_range: str,
         new_parser_rule: str,
+        *,
+        limit: int | None = None,
+        resume_replay_id: int | None = None,
     ) -> dict[str, Any]:
-        """用新解析规则版本回溯重放历史批次。"""
+        """用新解析规则版本回溯重放指定历史批次范围内的原始日志。
+
+        关键约束：
+        - 先解析范围并校验每个批号真实存在；不存在的批号直接报错，
+          且在校验通过前不创建任何重放任务，杜绝错误来源残留。
+        - 只处理确认范围里的原始记录/标准化明细，范围外记录（含其他
+          批次已校验通过的记录）完全不触碰，照常进入统计。
+        - 对范围内每条原文真用新规则重新解析一遍（而非替换版本标签），
+          并记录读取到的原文指纹，可核对本次究竟读取了哪份原文。
+        - 支持中断接续：limit 截断后保留「重放中」任务，再次调用时
+          传 resume_replay_id 接续实际尚未读取的范围。
+        """
         replayers = store.rows("replay_engine")
 
-        replay_id = _next_id("replay_engine")
-        replay_entry = {
-            "id": replay_id,
-            "历史批次范围": history_batch_range,
-            "新解析规则版本": new_parser_rule,
-            "重放状态": "已创建",
-            "产出记录数": "0",
-            "执行时间": _now_iso(),
-            "status": "重放中",
-            "pending": True,
-            "abnormal": False,
-        }
-        replayers.append(replay_entry)
+        # ---- 接续模式：找回未完成的重放任务，沿用原范围与规则 ----
+        if resume_replay_id is not None:
+            replay_entry = next(
+                (r for r in replayers if int(r.get("id", -1)) == int(resume_replay_id)),
+                None,
+            )
+            if replay_entry is None:
+                return {
+                    "ok": False,
+                    "message": f"重放任务 {resume_replay_id} 不存在，无法接续",
+                }
+            if replay_entry.get("status") != "重放中":
+                return {
+                    "ok": False,
+                    "message": (
+                        f"重放任务 {resume_replay_id} 已处于"
+                        f"{replay_entry.get('status')} 状态，不可接续"
+                    ),
+                }
+            scope = list(replay_entry.get("scope_batches", []))
+            rule_label = str(replay_entry.get("新解析规则版本", ""))
+        else:
+            scope = self._resolve_batch_scope(history_batch_range)
+            if not scope:
+                return {"ok": False, "message": "重放批次范围为空，未执行重放"}
 
-        # 对历史批次的原始日志重新解析
-        parsed = store.rows("parsed_entity")
-        replay_count = 0
-        for entity in parsed:
-            if entity.get("status") == "校验通过":
-                entity["status"] = "待校验"
-                entity["pending"] = True
-                entity["解析规则版本"] = new_parser_rule
-                entity["replay_id"] = str(replay_id)
-                entity["replayed_at"] = _now_iso()
-                replay_count += 1
+            # ---- 批号必须真实存在，错误在任何写入之前返回 ----
+            batches = store.rows("ingest_batch")
+            existing = {b.get("批次编号") for b in batches}
+            missing = [b for b in scope if b not in existing]
+            if missing:
+                return {
+                    "ok": False,
+                    "message": f"重放批次不存在：{'、'.join(missing)}，未创建重放任务",
+                    "missing_batches": missing,
+                }
 
-        replay_entry["产出记录数"] = str(replay_count)
-        replay_entry["status"] = "已完成"
+            replay_id = _next_id("replay_engine")
+            replay_entry = {
+                "id": replay_id,
+                "历史批次范围": history_batch_range,
+                "新解析规则版本": new_parser_rule,
+                "重放状态": "重放中",
+                "产出记录数": "0",
+                "执行时间": _now_iso(),
+                "status": "重放中",
+                "pending": True,
+                "abnormal": False,
+                "scope_batches": scope,
+                "processed_raw_ids": [],
+                "processed_digests": [],
+                "total_in_scope": 0,
+            }
+            replayers.append(replay_entry)
+            rule_label = new_parser_rule
+
+        # ---- 规则必须可定位，规则错误同样不允许留下半截任务数据 ----
+        rule = self._find_parser_rule(rule_label)
+        if rule is None:
+            if resume_replay_id is None:
+                replayers.remove(replay_entry)
+            return {
+                "ok": False,
+                "message": f"解析规则 {rule_label} 不存在且无已发布规则可用，未执行重放",
+            }
+        # 规则名存在则以该规则解析；标签始终沿用任务声明的新版本号
+        rule_label = str(replay_entry.get("新解析规则版本", rule_label))
+        schema_ver = self._current_schema_version()
+
+        # ---- 取数链路：只读取确认范围内的原始日志，按稳定顺序处理 ----
+        raw_records_list = store.rows("raw_records")
+        scope_set = set(scope)
+        scope_raw = sorted(
+            (r for r in raw_records_list if r.get("批次编号") in scope_set),
+            key=lambda r: (str(r.get("批次编号", "")), int(r.get("id", 0))),
+        )
+        replay_entry["total_in_scope"] = len(scope_raw)
+
+        processed_ids = {int(x) for x in replay_entry.get("processed_raw_ids", [])}
+        pending_raw = [r for r in scope_raw if int(r["id"]) not in processed_ids]
+        if limit is not None and limit >= 0:
+            chunk = pending_raw[:limit]
+        else:
+            chunk = pending_raw
+        interrupted = len(chunk) < len(pending_raw)
+
+        reprocessed: list[dict[str, Any]] = []
+        read_sources: list[dict[str, Any]] = []
+        for raw in chunk:
+            raw_id = int(raw["id"])
+            body_digest = raw.get("body_digest") or _stable_digest(
+                {"body": raw.get("原始正文", "")}
+            )
+            entity = self._reparse_raw_record(
+                raw, rule, rule_label, int(replay_entry["id"]), schema_ver
+            )
+            reprocessed.append(entity)
+            processed_ids.add(raw_id)
+            replay_entry.setdefault("processed_digests", []).append(body_digest)
+            read_sources.append(
+                {
+                    "raw_record_id": raw_id,
+                    "批次编号": raw.get("批次编号"),
+                    "raw_version": raw.get("raw_version", 1),
+                    "body_digest": body_digest,
+                }
+            )
+
+        replay_entry["processed_raw_ids"] = sorted(processed_ids)
+        replay_entry["产出记录数"] = str(len(processed_ids))
+
+        # ---- 中断：保留实际读取进度，等待接续 ----
+        if interrupted:
+            replay_entry["status"] = "重放中"
+            replay_entry["重放状态"] = "重放中"
+            replay_entry["pending"] = True
+            replay_entry["resumed_at"] = _now_iso()
+            return {
+                "ok": True,
+                "message": (
+                    f"重放中断：已处理 {len(processed_ids)}/"
+                    f"{replay_entry['total_in_scope']}，可凭 replay_id 接续"
+                ),
+                "replay": replay_entry,
+                "interrupted": True,
+                "replayed_count": len(reprocessed),
+                "scope": scope,
+                "read_sources": read_sources,
+            }
+
+        # ---- 完成：标准化明细的校验只读取范围内本轮重解析的明细 ----
+        validation = self.validate_entities(
+            batch_no=None,
+            scope_batches=scope,
+            replay_id=int(replay_entry["id"]),
+        )
+
+        # ---- 本轮结果回写血缘清单 ----
+        lineage_entries = self._write_replay_lineage(
+            replay_entry, scope, rule_label
+        )
+
+        failed = int(validation.get("failed", 0))
+        final_status = "部分失败" if failed else "已完成"
+        replay_entry["status"] = final_status
+        replay_entry["重放状态"] = final_status
         replay_entry["pending"] = False
-        replay_entry["重放状态"] = "已完成"
+        replay_entry["abnormal"] = failed > 0
+        replay_entry["completed_at"] = _now_iso()
+        replay_entry["validation"] = validation
+        replay_entry["lineage_ids"] = [str(x["id"]) for x in lineage_entries]
 
         return {
             "ok": True,
-            "message": f"历史批次 {history_batch_range} 用规则 {new_parser_rule} 重放完成",
+            "message": f"历史批次 {history_batch_range} 用规则 {rule_label} 重放完成",
             "replay": replay_entry,
-            "replayed_count": replay_count,
+            "replayed_count": len(reprocessed),
+            "scope": scope,
+            "read_sources": read_sources,
+            "lineage": lineage_entries,
+            "validation": validation,
+            "interrupted": False,
         }
 
     # ---------- Schema 版本演进 ----------

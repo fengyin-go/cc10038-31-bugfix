@@ -56,6 +56,14 @@ class WatermarkPayload(BaseModel):
 class ReplayPayload(BaseModel):
     history_batch_range: str = Field(..., min_length=1)
     new_parser_rule: str = Field(..., min_length=1)
+    limit: int | None = Field(default=None, ge=0)
+    resume_replay_id: int | None = None
+
+
+class CorrectRawPayload(BaseModel):
+    batch_no: str = Field(..., min_length=1)
+    raw_record_id: int
+    new_body: str = Field(..., min_length=1)
 
 
 class SchemaEvolvePayload(BaseModel):
@@ -126,7 +134,19 @@ def pipeline_advance_watermark(payload: WatermarkPayload) -> dict[str, Any]:
 
 @router.post("/replay/batch")
 def pipeline_replay_batch(payload: ReplayPayload) -> dict[str, Any]:
-    return pipeline.replay_batch(payload.history_batch_range, payload.new_parser_rule)
+    return pipeline.replay_batch(
+        payload.history_batch_range,
+        payload.new_parser_rule,
+        limit=payload.limit,
+        resume_replay_id=payload.resume_replay_id,
+    )
+
+
+@router.post("/replay/correct-raw")
+def pipeline_correct_raw(payload: CorrectRawPayload) -> dict[str, Any]:
+    return pipeline.correct_raw_record(
+        payload.batch_no, payload.raw_record_id, payload.new_body
+    )
 
 
 @router.post("/schema/evolve")
